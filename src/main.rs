@@ -10,7 +10,7 @@ use cargo::{
 };
 use clap::{App as Clap, Arg, SubCommand};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     fmt,
     fs,
@@ -91,7 +91,7 @@ fn main() -> CargoResult<()> {
         eprintln!("But I need this directory...");
     }
 
-    //let mut cache = HashMap::with_capacity(64);
+    let mut cache = HashSet::with_capacity(64);
     let mut stack = Vec::with_capacity(64);
 
     stack.push(StackEntry {
@@ -116,8 +116,16 @@ fn main() -> CargoResult<()> {
                         .insert(package.name().to_string(), PackagePath::Git(url));
                     continue;
                 } else {
-                    // Can't push while .last() is borrowed
-                    to_add = Some(package);
+                    if cache.contains(&entry.package.package_id()) {
+                        let name = entry.package.name().to_string();
+
+                        let path = basedir.join(&name);
+                        entry.updated.get_or_insert_with(|| HashMap::with_capacity(4))
+                            .insert(name.clone(), PackagePath::Path(path));
+                    } else {
+                        // Can't push while .last() is borrowed
+                        to_add = Some(package);
+                    }
                 }
             }
         }
@@ -138,7 +146,9 @@ fn main() -> CargoResult<()> {
             let mut name = None;
             if let Some(entry) = stack.pop() {
                 let package = entry.package;
-                if let Some(replaces) = entry.updated {
+                if cache.contains(&entry.package.package_id()) {
+                    name = Some(package.name());
+                } else if let Some(ref replaces) = entry.updated {
                     let _dest;
                     let manifest = if !stack.is_empty() {
                         let path = package.manifest_path().parent().expect("Manifest path didn't have parent");
@@ -159,7 +169,7 @@ fn main() -> CargoResult<()> {
                     let mut parsed: toml::Value = toml::from_str(&contents)?;
                     for table in &["dependencies", "dev-dependencies", "build-dependencies"] {
                         if let Some(deps) = parsed.get_mut(table) {
-                            for (key, value) in &replaces {
+                            for (key, value) in replaces {
                                 if let Some(dep) = deps.get_mut(key) {
                                     let mut map = BTreeMap::new();
                                     match value {
@@ -178,6 +188,8 @@ fn main() -> CargoResult<()> {
                         }
                     }
                     fs::write(manifest, toml::to_string_pretty(&parsed)?)?;
+
+                    cache.insert(package.package_id());
                 }
             }
             if let Some(name) = name {
