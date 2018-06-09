@@ -1,0 +1,9 @@
+[package]
+name = "cargo-patch"
+version = "0.1.0"
+authors = ["jD91mZM2 <me@krake.one>"]
+
+[dependencies]
+clap = "2.31.2"
+cargo = "0.27.0"
+toml = "0.4.6"
