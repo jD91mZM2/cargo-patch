@@ -4,7 +4,7 @@ extern crate toml;
 
 use cargo::{
     CargoResult,
-    core::{dependency::Dependency, Package, Workspace},
+    core::{Package, PackageId, Workspace},
     ops,
     util::{config::Config, important_paths}
 };
@@ -12,6 +12,7 @@ use clap::{App as Clap, Arg, SubCommand};
 use std::{
     collections::{BTreeMap, HashMap},
     env,
+    fmt,
     fs,
     io,
     path::{Path, PathBuf}
@@ -22,11 +23,18 @@ enum PackagePath<'a> {
     Path(PathBuf)
 }
 struct StackEntry<'a, I>
-    where I: Iterator<Item = &'a Dependency>
+    where I: Iterator<Item = &'a PackageId>
 {
     package: &'a Package,
     dependencies: I,
     updated: Option<HashMap<String, PackagePath<'a>>>
+}
+impl<'a, I> fmt::Debug for StackEntry<'a, I>
+    where I: Iterator<Item = &'a PackageId>
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.package)
+    }
 }
 
 fn main() -> CargoResult<()> {
@@ -73,7 +81,7 @@ fn main() -> CargoResult<()> {
     let workspace = Workspace::new(&manifest, &config)?;
     let package = workspace.current()?;
 
-    let (packages, _) = ops::resolve_ws(&workspace)?;
+    let (packages, resolve) = ops::resolve_ws(&workspace)?;
 
     let basedir = cwd.join("cargo-patch");
     if !basedir.exists() {
@@ -83,12 +91,12 @@ fn main() -> CargoResult<()> {
         eprintln!("But I need this directory...");
     }
 
-    let mut processed = Vec::with_capacity(64);
+    //let mut cache = HashMap::with_capacity(64);
     let mut stack = Vec::with_capacity(64);
 
     stack.push(StackEntry {
         package: package,
-        dependencies: package.dependencies().into_iter(),
+        dependencies: resolve.deps(package.package_id()),
         updated: None
     });
 
@@ -100,30 +108,31 @@ fn main() -> CargoResult<()> {
                 None => break
             };
 
-            if let Some(dependency) = entry.dependencies.next() {
-                if let Some(id) = packages.package_ids().find(|id| dependency.matches_id(id)) {
-                    let package = packages.get(&id)?;
+            if let Some(id) = entry.dependencies.next() {
+                let package = packages.get(&id)?;
 
-                    if let Some(url) = replace.get(&*package.name()) {
-                        entry.updated.get_or_insert_with(|| HashMap::with_capacity(4))
-                            .insert(package.name().to_string(), PackagePath::Git(url));
-                    } else {
-                        // Can't push while .last() is borrowed
-                        to_add = Some(package);
-                    }
+                if let Some(url) = replace.get(&*package.name()) {
+                    entry.updated.get_or_insert_with(|| HashMap::with_capacity(4))
+                        .insert(package.name().to_string(), PackagePath::Git(url));
+                    continue;
+                } else {
+                    // Can't push while .last() is borrowed
+                    to_add = Some(package);
                 }
             }
         }
         if let Some(package) = to_add {
             let id = package.package_id();
-            if !processed.contains(&id) {
-                processed.push(id);
-
+            if stack.iter().all(|entry| entry.package.package_id() != id) {
                 stack.push(StackEntry {
                     package: package,
-                    dependencies: package.dependencies().into_iter(),
+                    dependencies: resolve.deps(&id).into_iter(),
                     updated: None
                 });
+            } else {
+                eprintln!("Stuck in dependency loop!");
+                eprintln!("Package wants {}, but this appears previously in the stack!", package);
+                return Ok(());
             }
         } else {
             let mut name = None;
