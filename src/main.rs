@@ -89,6 +89,7 @@ fn main() -> CargoResult<()> {
     } else if !basedir.is_dir() {
         eprintln!("File \"cargo-patch\" exists but is not a folder.");
         eprintln!("But I need this directory...");
+        return Ok(());
     }
 
     let mut cache = HashSet::with_capacity(64);
@@ -115,20 +116,21 @@ fn main() -> CargoResult<()> {
                     entry.updated.get_or_insert_with(|| HashMap::with_capacity(4))
                         .insert(package.name().to_string(), PackagePath::Git(url));
                     continue;
-                } else {
-                    if cache.contains(&entry.package.package_id()) {
-                        let name = entry.package.name().to_string();
+                } else if cache.contains(&entry.package.package_id()) {
+                    let name = entry.package.name().to_string();
 
-                        let path = basedir.join(&name);
-                        entry.updated.get_or_insert_with(|| HashMap::with_capacity(4))
-                            .insert(name.clone(), PackagePath::Path(path));
-                    } else {
-                        // Can't push while .last() is borrowed
-                        to_add = Some(package);
-                    }
+                    let path = basedir.join(&name);
+                    entry.updated.get_or_insert_with(|| HashMap::with_capacity(4))
+                        .insert(name.clone(), PackagePath::Path(path));
+                } else {
+                    // Can't push while .last() is borrowed
+                    to_add = Some(package);
                 }
             }
         }
+
+        let mut name = None;
+
         if let Some(package) = to_add {
             let id = package.package_id();
             if stack.iter().all(|entry| entry.package.package_id() != id) {
@@ -142,36 +144,37 @@ fn main() -> CargoResult<()> {
                 eprintln!("Package wants {}, but this appears previously in the stack!", package);
                 return Ok(());
             }
-        } else {
-            let mut name = None;
-            if let Some(entry) = stack.pop() {
-                let package = entry.package;
-                if cache.contains(&entry.package.package_id()) {
-                    name = Some(package.name());
-                } else if let Some(ref replaces) = entry.updated {
-                    let _dest;
-                    let manifest = if !stack.is_empty() {
-                        let path = package.manifest_path().parent().expect("Manifest path didn't have parent");
-                        let dest = basedir.join(&*package.name());
-                        if dest.exists() {
-                            println!("Skipping {}", package.name());
-                        } else {
-                            println!("Copying {}...", package.name());
-                            copy(&path, &dest)?;
-                        }
-                        name = Some(package.name());
-                        _dest = dest.join("Cargo.toml");
-                        &_dest
+        } else if let Some(entry) = stack.pop() {
+            let package = entry.package;
+            if cache.contains(&entry.package.package_id()) {
+                name = Some(package.name());
+            } else if let Some(ref replaces) = entry.updated {
+                let _dest;
+                let manifest = if !stack.is_empty() {
+                    let path = package.manifest_path().parent().expect("Manifest path didn't have parent");
+                    let dest = basedir.join(&*package.name());
+                    if dest.exists() {
+                        println!("Skipping {}", package.name());
                     } else {
-                        &manifest
-                    };
-                    let contents = fs::read_to_string(manifest)?;
-                    let mut parsed: toml::Value = toml::from_str(&contents)?;
-                    for table in &["dependencies", "dev-dependencies", "build-dependencies"] {
-                        if let Some(deps) = parsed.get_mut(table) {
-                            for (key, value) in replaces {
-                                if let Some(dep) = deps.get_mut(key) {
-                                    let mut map = BTreeMap::new();
+                        println!("Copying {}...", package.name());
+                        copy(&path, &dest)?;
+                    }
+                    name = Some(package.name());
+                    _dest = dest.join("Cargo.toml");
+                    &_dest
+                } else {
+                    &manifest
+                };
+                let contents = fs::read_to_string(manifest)?;
+                let mut parsed: toml::Value = toml::from_str(&contents)?;
+                for table in &["dependencies", "dev-dependencies", "build-dependencies"] {
+                    if let Some(deps) = parsed.get_mut(table) {
+                        for (key, value) in replaces {
+                            if let Some(dep) = deps.get_mut(key) {
+                                fn change_path(map: &mut BTreeMap<String, toml::Value>, value: &PackagePath) {
+                                    for key in &["version", "path", "git"] {
+                                        map.remove(*key);
+                                    }
                                     match value {
                                         PackagePath::Path(path) => {
                                             map.insert(String::from("path"), toml::Value::String(
@@ -182,22 +185,34 @@ fn main() -> CargoResult<()> {
                                             map.insert(String::from("git"), toml::Value::String(url.to_string()));
                                         }
                                     }
-                                    *dep = toml::Value::Table(map);
+                                }
+                                match dep {
+                                    toml::Value::Table(inner) => change_path(inner, value),
+                                    toml::Value::String(_) => {
+                                        let mut map = BTreeMap::new();
+                                        change_path(&mut map, value);
+                                        *dep = toml::Value::Table(map);
+                                    },
+                                    _ => {
+                                        eprintln!("Invalid value in Cargo.toml");
+                                        eprintln!("Dependency {:?} is not a string nor a table", key);
+                                        return Ok(());
+                                    }
                                 }
                             }
                         }
                     }
-                    fs::write(manifest, toml::to_string_pretty(&parsed)?)?;
+                }
+                fs::write(manifest, toml::to_string_pretty(&parsed)?)?;
 
-                    cache.insert(package.package_id());
-                }
+                cache.insert(package.package_id());
             }
-            if let Some(name) = name {
-                if let Some(entry) = stack.last_mut() {
-                    let path = basedir.join(&*name);
-                    entry.updated.get_or_insert_with(|| HashMap::with_capacity(4))
-                        .insert(name.to_string(), PackagePath::Path(path));
-                }
+        }
+        if let Some(name) = name {
+            if let Some(entry) = stack.last_mut() {
+                let path = basedir.join(&*name);
+                entry.updated.get_or_insert_with(|| HashMap::with_capacity(4))
+                    .insert(name.to_string(), PackagePath::Path(path));
             }
         }
     }
